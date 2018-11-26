@@ -1,0 +1,103 @@
+---
+title: "R Notebook"
+author: "tobiasst"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{r init, message=F, warning=F}
+library(parallel)
+library(pbapply)
+library(GenomicRanges)
+library(tsTools)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+library(multtest)
+library(Biostrings)
+library(rtracklayer)
+
+
+## remove non-canonical chromosomes from genome
+includeChrs <- paste0("chr",c("2L","2R","3L","3R","4","X","Y","M"))
+keepBSgenomeSequences <- function(genome, seqnames)
+{
+    stopifnot(all(seqnames %in% seqnames(genome)))
+    genome@user_seqnames <- setNames(seqnames, seqnames)
+    genome@seqinfo <- genome@seqinfo[seqnames]
+    genome
+}
+Dmelanogaster <- keepBSgenomeSequences(BSgenome.Dmelanogaster.UCSC.dm6, includeChrs)
+
+samples <- read.delim("SraRunTable.txt")
+
+```
+
+```{r}
+## load specs
+specsList <- lapply(samples$Run, function(x) {
+   readRDS(paste0(x,"_out/",x,"_dyadCov_spec_189.rds"))
+})
+
+## standardize, return linear
+stdSpecsList <- pblapply(specsList, function(covs) {
+	v <- log2(as.vector(unlist(covs)))
+	flt <- v!=0 & !is.infinite(v)
+	m <- mean(v[flt], na.rm=T)
+	std <- sd(v[flt], na.rm=T)
+	covss <- round(2^(((log2(covs)-m) / std)), 2)
+	names(covss) <- names(covs)
+	covss
+})
+
+wt <- !grepl("^acf", samples$genotype)
+
+## get the condition mean
+specAvgWt <- Reduce("+", stdSpecsList[wt])/sum(wt)
+specAvgAcf <- Reduce("+", stdSpecsList[!wt])/sum(!wt)
+
+cutoff <- 2.5
+
+## get PNAs on which differences should be estimated
+wtPNA <- as(slice(specAvgWt, lower=cutoff, rangesOnly=T), "GRanges")
+acfPNA <- as(slice(specAvgAcf, lower=cutoff, rangesOnly=T), "GRanges")
+olPNA <- reduce(c(wtPNA,acfPNA))
+# filter regions > 500 bp
+olPNA <- olPNA[width(olPNA)>500]
+
+## get specs in all samples for all PNAs
+res <- pblapply(stdSpecsList, function(x) {unlist(lapply(x[olPNA], mean))})
+mat <- Reduce(cbind, res)
+colnames(mat) <- samples$Run
+rownames(mat) <- paste(seqnames(olPNA), start(olPNA), end(olPNA), sep="_")
+```
+ 
+```{r}
+groups <- factor(as.integer(!wt))
+
+mat <- log2(mat+0.01)
+p.val <- apply(mat, 1, function(x){t.test(x~groups)$p.value})
+logFC <- apply(mat, 1, function(x){t.test(x~groups) -> tt; tt$estimate[2]-tt$estimate[1]})
+mt <- mt.rawp2adjp(p.val, "BH")
+adj.p.val <- mt$adjp[order(mt$index),2]
+
+df <- data.frame(mat, p.val, adj.p.val, logFC)
+
+flt <- df$adj.p.val<0.20 & df$logFC<0
+olPNA[flt]
+downPNA <- olPNA[flt] 
+```
+
+```{r}
+seqs <- getSeq(Dmelanogaster, downPNA)
+names(seqs) <- paste(seqnames(downPNA), start(downPNA), end(downPNA), sep="_")
+writeXStringSet(seqs, "seqs/downPNA.fasta")
+export.bed(downPNA, "seqs/downPNA.bed")
+```
+ 
+ 
+```{r}
+sessionInfo()
+```
+

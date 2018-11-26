@@ -1,0 +1,112 @@
+---
+title: "R Notebook"
+author: "tobiasst"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r init, message=F, warning=F}
+library(parallel)
+library(pbapply)
+library(GenomicRanges)
+library(tsTools)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+
+## remove non-canonical chromosomes from genome
+includeChrs <- paste0("chr",c("2L","2R","3L","3R","4","X","Y","M"))
+keepBSgenomeSequences <- function(genome, seqnames)
+{
+    stopifnot(all(seqnames %in% seqnames(genome)))
+    genome@user_seqnames <- setNames(seqnames, seqnames)
+    genome@seqinfo <- genome@seqinfo[seqnames]
+    genome
+}
+Dmelanogaster <- keepBSgenomeSequences(BSgenome.Dmelanogaster.UCSC.dm6, includeChrs)
+
+samples <- read.delim("SraRunTable.txt")
+
+```
+
+## Filtering, Subsampling & Dyad coverages
+
+```{r, message=F, warning=F, error=F}
+## load ranges
+rangesList <- lapply(samples$Run, function(x) {
+   readRDS(paste0(x,"_out/",x,"_ranges.rds"))
+})
+
+## apply seqinfo (better done before!)
+rangesList <- pblapply(rangesList, function(x) {
+  seqlevels(x) <- includeChrs
+  seqinfo(x) <- seqinfo(Dmelanogaster)
+  x})
+
+lapply(rangesList, function(x) {table(seqnames(x))})
+
+## filter fragments for size 120-200
+rangesList <- pblapply(rangesList, function(x) {
+  flt <- width(x) >= 120 & width(x) <= 200
+  x[flt]
+})
+
+## subsample to smalles library size
+minLibSize <- min(unlist(lapply(rangesList, length)))
+subRangesList <- pblapply(rangesList, function(x) {
+  idx <- sample(1:length(x), minLibSize)
+  x[idx]
+})
+
+## coverages of 50bp dyads
+dyadCovList <- pblapply(subRangesList, function(x){
+  dyads <- resize(x, 50, fix="center")
+  coverage(dyads)
+})
+
+names(dyadCovList) <- samples$Run
+lapply(samples$Run, function(x) {
+   saveRDS(dyadCovList[[x]], paste0(x,"_out/",x,"_dyadCov.rds"))
+})
+
+```
+ 
+ ## get the autocorrelation function
+ 
+```{r}
+
+peaks<-function(series,span=100) 
+{ 
+	z <- embed(series, span) 
+	s <- span%/%2 
+	v<- max.col(z) == 1 + s 
+	result <- c(rep(FALSE,s),v) 
+	result <- result[1:(length(result)-s)] 
+	result 
+} 
+
+wtRuns <- samples$Run[!grepl("^acf1", samples$genotype)]
+
+
+max.lag <- 1000
+
+repeatLengths <- pblapply(dyadCovList[wtRuns], function(cov) {
+  v <- as.vector(unlist(cov[["chr2L"]]))
+  ac <- acf(v, lag.max=max.lag)
+  y <- as.vector(ac$acf)
+  x <- 0:max.lag
+  peaksPos <- which(peaks(y, span=100))[1:4]
+  Peaks <- 1:length(peaksPos)
+  fit <- lm(peaksPos ~ Peaks - 1)
+  unname(round(fit$coefficients[1]))
+})
+
+spectralRepeatLength <- median(unlist(repeatLengths))
+spectralRepeatLength
+saveRDS(spectralRepeatLength, "spectralRepeatLength.rds")
+```
+ 
+```{r}
+sessionInfo()
+```
+
