@@ -3,3 +3,9 @@
 .RData
 .Ruserdata
 *_out
+.DS_Store
+hits/
+motifs/
+seqs/
+spectralRepeatLength.rds
+Baldi_recode.Rproj
