@@ -8,6 +8,8 @@ cd Baldi_recode
 ./01_prefetchSRA.sh
 ./02_runAlign_SLURM.sh
 
+## wait until done
+
 ####################################################
 Rscript -e 'library(knitr); purl("03_PNA_SDE.Rmd")'
 CMD_FOR_SUB=$(cat <<EOF
@@ -19,7 +21,11 @@ sbatch --mem 40000 --wrap="$CMD_FOR_SUB"
 rm 03_PNA_SDE.R
 ####################################################
 
+## wait until done
+
 ./04_runSDE_SLURM.sh
+
+## wait until done
 
 ####################################################
 Rscript -e 'library(knitr); purl("05_diffPhasing.Rmd")'
@@ -32,7 +38,11 @@ sbatch --mem 40000 --wrap="$CMD_FOR_SUB"
 rm 05_diffPhasing.R
 ####################################################
 
+## wait until done
+
 sbatch 06_de_novo_motif.sh
+
+## wait until done
 
 ####################################################
 Rscript -e 'library(knitr); purl("07_analyzeHits.Rmd")'
