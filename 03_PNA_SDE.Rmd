@@ -54,6 +54,7 @@ rangesList <- pblapply(rangesList, function(x) {
 ## subsample to smalles library size
 minLibSize <- min(unlist(lapply(rangesList, length)))
 subRangesList <- pblapply(rangesList, function(x) {
+  set.seed(1234)
   idx <- sample(1:length(x), minLibSize)
   x[idx]
 })
