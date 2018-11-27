@@ -9,3 +9,5 @@ motifs/
 seqs/
 spectralRepeatLength.rds
 Baldi_recode.Rproj
+*.err
+*.out
