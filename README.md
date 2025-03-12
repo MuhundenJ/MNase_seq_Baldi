@@ -1,4 +1,4 @@
-This pipeline demonstrates analysis of MNase-seq data for de novo identification and characterization of Phased Nucleosome Arrays originally developed by Baldi et al. and adapted for additional downstream analyses. 
+This pipeline demonstrates analysis of MNase-seq data for de novo identification and characterization of Phased Nucleosome Arrays originally developed by Baldi et al. and adapted for additional downstream analyses (such as detecting nucleosome periodicity using Autocorrelation analyses, statistical testing and chromatin state annotations). 
 
 Example downstream workflow (characterization of PNAs) is previewed here : https://htmlpreview.github.io/?https://github.com/MuhundenJ/MNase_seq_Baldi/blob/master/TRAX_EDA_v2.html
 
