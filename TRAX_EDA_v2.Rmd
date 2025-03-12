@@ -1,0 +1,550 @@
+---
+title: "Exploratory Data Analysis of Nucleosome Phasing in reconstituted chromatin"
+output: html_document
+---
+
+Here we utilize the Phased Nucleosome Array Identification pipeline as used in Baldi et al.,2018 MolCell to characterize nucleosome positioning in in-vitro chromatin assembled with Drosophila Embryonic Extract (DREX) optionally added with late Drosophila extract (TRAX). In vivo MNase-seq of fly embryos from Baldi et al will serve as reference.
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r init, message=FALSE}
+library(stringr)
+library(rtracklayer)
+library(GenomicFeatures)
+library(RColorBrewer)
+library(matrixStats)
+library(grid)
+library(gridBase)
+library(gridExtra)
+library(tsTools)
+library(BiocParallel)
+library(GenomicAlignments)
+library(LSD)
+library(csaw)
+library(pheatmap)
+library(Vennerable)
+library(writexl)
+library(LSD)
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene)
+library(IRanges)
+#library(ShortRead)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(genefilter)
+library(tidyverse)
+library(zoo)
+library(matrixStats)
+library(tsTools)
+library(Vennerable)
+#library(HelpersforChIPSeq)
+library(plotly)
+library(pbapply)
+library(ggsci)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+library(multtest)
+library(ChIPpeakAnno)
+
+#source("../functions/functions.R")
+
+`%nin%` = Negate(`%in%`)
+
+```
+
+Experiment type: MNase-seq
+Samples: 2 replicates each of DREX +/- TRAX (200 or 400 ug) along with Fly Embryo MNase from Baldi et al Mol Cell 2019 (Phaser study)
+
+Align raw reads according to Tobias and generate coverages (Run 02_align_slurm.sh -> This should generate .rds coverage objects)
+
+### Load necessary files 
+
+Use genome.gtf file corresponding to BDGP6 v104, filtered for genes with only FBgn ID.
+Load MNase-seq coverages and preprocess data to downsample to lowest library size(important!), size-select nucleosomal fragments, center the fragments and trim to 50 bp (indicative of nucleosomal centers).
+
+```{r data-preproc}
+
+my_chromosomes <- c("chr2L","chr2R","chr3L","chr3R","chrX","chrY","chr4")
+my_lengths <- seqlengths(keepSeqlevels(TxDb.Dmelanogaster.UCSC.dm6.ensGene, my_chromosomes, pruning.mode = "coarse"))
+
+my_allgenes <- makeTxDbFromGFF("/Users/ra36doj/Desktop/Study/Data/Sequencing/RNAseq/RNASeqAnalysis/genome.gtf",format="gtf")
+my_allgenes <- genes(my_allgenes)
+seqlevelsStyle(my_allgenes) <- "UCSC"
+my_allgenes <- keepSeqlevels(my_allgenes,  my_chromosomes, pruning.mode="coarse")
+my_allgenes <- my_allgenes[grepl("FBgn",my_allgenes$gene_id)]
+
+### define centers of first 1000bp regions of TSS 
+my_TSR <- data.frame(chr = seqnames(my_allgenes),
+                     center = ifelse(strand(my_allgenes) == "+", start(my_allgenes)+500, end(my_allgenes)-500),
+                     strand = strand(my_allgenes))
+rownames(my_TSR) <- my_allgenes$gene_id
+
+
+
+files <- list.files("../Gizem-DREX/raw/", pattern = ".rds",full.names = T)
+file_names <- gsub(".rds","",list.files("../Gizem-DREX/raw/", pattern = ".rds",full.names = F))
+
+
+rangesList <- lapply(files, function(x) {
+   readRDS(x)
+})
+
+## apply seqinfo (better done before!)
+rangesList <- pblapply(rangesList, function(x) {
+  x <- keepSeqlevels(x,my_chromosomes, pruning.mode = "coarse")
+  seqlengths(x) <- my_lengths
+  x})
+
+### how many reads per chromosome for each sample
+lapply(rangesList, function(x) {table(seqnames(x))})
+
+## filter fragments for size 120-200
+rangesList <- pblapply(rangesList, function(x) {
+  flt <- width(x) >= 120 & width(x) <= 200
+  x[flt]
+})
+
+## subsample to smalles library size
+minLibSize <- min(unlist(lapply(rangesList, length)))
+subRangesList <- pblapply(rangesList, function(x) {
+  set.seed(1234)
+  idx <- sample(1:length(x), minLibSize)
+  x[idx]
+})
+
+## coverages of 50bp dyads
+dyadCovList <- pblapply(subRangesList, function(x){
+  dyads <- resize(x, 50, fix="center")
+  coverage(dyads)
+})
+
+names(dyadCovList) <- file_names
+lapply(file_names, function(x) {
+   saveRDS(dyadCovList[[x]], paste0(x,"_dyadCov.rds"))
+})
+
+
+```
+
+## Get autocorrelation function based on Baldi et al 
+
+For first step, we look at autocorrelation genome wide (for Chr2 and 3) and calculate repeat lengths which are necessary for Spectral Density Estimation. This reflects the periodicity of nucleosome positions in the data
+
+```{r ACF_genomewide}
+
+peaks<-function(series,span=100) 
+{ 
+	z <- embed(series, span) 
+	s <- span%/%2 
+	v<- max.col(z) == 1 + s 
+	result <- c(rep(FALSE,s),v) 
+	result <- result[1:(length(result)-s)] 
+	result 
+} 
+
+max.lag <- 1000
+
+
+repeatLengths <- pblapply(dyadCovList, function(my_cov){
+  cov <- my_cov
+  v <- as.vector(unlist(cov[c("chr2L","chr2R","chr3L","chr3R")]))
+  ac <- acf(v, lag.max=max.lag)
+
+  y <- as.vector(ac$acf)
+  x <- 0:max.lag
+  peaksPos <- which(peaks(y, span=100))[1:4]
+  Peaks <- 1:length(peaksPos)
+  fit <- lm(peaksPos ~ Peaks - 1)
+  return(list(y,unname(round(fit$coefficients[1]))))
+
+})
+
+#print(repeatLengths)
+
+
+plt <- cbind(data.frame(lag=0:max.lag),as.data.frame(lapply(repeatLengths, `[[`, 1))) %>% pivot_longer(cols=-lag,names_to="Sample",values_to = "ACF")        %>% ggplot(aes(x=lag,y=ACF,col=Sample)) + geom_line() + scale_color_tron() +theme_bw() 
+plt
+
+#pdf(file="ACF_genomewide.pdf")
+#plt
+#dev.off()
+
+spectralRepeatLength <- median(unlist(lapply(repeatLengths, `[[`, 2)))
+spectralRepeatLength
+saveRDS(spectralRepeatLength, "spectralRepeatLength.rds")
+```
+
+In-vivo MNase looks very nice ! - Whole genome repeat length of ~180 bp. DREX and TRAX are variable (batch effect) - nucleosomes might be regularly spaced but they are
+probably not PHASED. How about if we look first 1000 bp of TSS of genes instead of genome-wide autocorrelation?
+
+
+```{r ACF_TSS}
+
+max.lag <- 1000
+
+
+my_window_size <- 1000
+
+i=1
+
+my_cov <- dyadCovList[[1]]
+
+repeatLengths_TSR <- pblapply(dyadCovList,FUN = function(my_cov){
+ 
+  ## generate matrices containing 1000 bp windows from start site
+  my_mat <- coverageWindowsCenteredStranded(centers = my_TSR,
+                                            window.size = my_window_size,
+                                            coverage = my_cov)
+  ## force to linear for ACF analysis
+  v <- as.vector(unlist(t(my_mat)))
+  ac <- acf(v,lag.max = max.lag)
+  y <- as.vector(ac$acf)
+  x <- 0:max.lag
+  peaksPos <- which(peaks(y, span=100))[1:4]
+  Peaks <- 1:length(peaksPos)
+  if (all(is.na(peaksPos))){
+    return(list(y,NA))
+  } else {
+    fit <- lm(peaksPos ~ Peaks - 1)
+    return(list(y,unname(round(fit$coefficients[1]))))
+  }
+  
+})
+
+#print(repeatLengths_TSR)
+
+
+plt <- cbind(data.frame(lag=0:max.lag),as.data.frame(lapply(repeatLengths_TSR, `[[`, 1))) %>% pivot_longer(cols=-lag,names_to="Sample",values_to = "ACF")        %>% ggplot(aes(x=lag,y=ACF,col=Sample,group=Sample)) + geom_line() + scale_color_tron() +theme_bw() 
+plt
+
+#pdf(file="ACF_TSR.pdf")
+#plt
+#dev.off()
+
+spectralRepeatLength_TSR <- median(unlist(lapply(repeatLengths_TSR, `[[`, 2)),na.rm = T)
+spectralRepeatLength_TSR
+saveRDS(spectralRepeatLength_TSR, "spectralRepeatLength_TSR.rds")
+```
+
+Similar patterns observed for the first 1000 bp of genes. 
+
+Dyad coveraages were used to calculate SDEs using 04_SDE. scripts. In short, Spectral Density Estimation searches for periodicity of a given value (here ~180bp) in series-like data. Arrays of high regularity are identified by a high SDE score and are called as Phased Nucleosome Arrays (PNAs). The generated arrays were z-score transformed (per chromosome z-score transformation) and visualized on IGV. Identify PNAs at two cutoffs (z=2.5 and z=1.5)
+
+Identify PNAs that are statistically significant from across samples. First we 'call' PNAs using an arbitrary threshold (only the high-value threshold was used for downstream analyses). 
+
+```{r Differential PNAs}
+my_samples <- list.files(pattern="_dyadCov_spec_180.5.rds")
+
+specsList <- lapply(my_samples, function(x) {
+   readRDS(x)
+})
+
+## standardize, return linear
+stdSpecsList <- pblapply(specsList, function(covs) {
+	v <- log2(as.vector(unlist(covs)))
+	flt <- v!=0 & !is.infinite(v)
+	m <- mean(v[flt], na.rm=T)
+	std <- sd(v[flt], na.rm=T)
+	covss <- round(2^(((log2(covs)-m) / std)), 2)
+	names(covss) <- names(covs)
+	covss
+})
+
+names(stdSpecsList) <- my_samples
+## get the condition mean  - leave out replicate 1
+
+FlyWT <- grepl("Fly_Baldi", my_samples)
+DREX <- grepl("DREX_rep2", my_samples)
+TRAX <- grepl("TRAX200_rep2", my_samples)
+
+#aeraging when multiple replicates
+specAvgWT <- Reduce("+", stdSpecsList[FlyWT])/sum(FlyWT)
+specAvgDREX <- Reduce("+", stdSpecsList[DREX])/sum(DREX)
+specAvgTRAX <- Reduce("+", stdSpecsList[TRAX])/sum(TRAX)
+
+cutoff_high <- 2.5
+cutoff_low <- 1.5
+
+## get PNAs on which differences should be estimated
+wtPNA_high <- as(IRanges::slice(specAvgWT, lower=cutoff_high, rangesOnly=T), "GRanges")
+DREXPNA_high <- as(IRanges::slice(specAvgDREX, lower=cutoff_high, rangesOnly=T), "GRanges")
+TRAXPNA_high <- as(IRanges::slice(specAvgTRAX, lower=cutoff_high, rangesOnly=T), "GRanges")
+
+### similar number of PNAs for all conditions ! 
+
+olPNA_high <- GenomicRanges::reduce(c(wtPNA_high,DREXPNA_high,TRAXPNA_high))
+# filter regions > 500 bp
+olPNA_high <- olPNA_high[width(olPNA_high)>500]
+olPNA_high
+### around 11k PNAs
+
+stdSpecsList_sub <- stdSpecsList
+
+## get specs in all samples for all PNAs - keep the exluded Replicates as well
+res <- pblapply(stdSpecsList, function(x) {unlist(lapply(x[olPNA_high], mean))})
+mat <- Reduce(cbind, res)
+colnames(mat) <- gsub("_ranges_dyadCov_spec_180.5.rds","",my_samples)
+rownames(mat) <- paste(seqnames(olPNA_high), start(olPNA_high), end(olPNA_high), sep="_")
+
+head(mat)
+```
+These ~11k high-threshold PNAs are now stored in matrices (with rownames indicating their genomic position). 
+
+We now have MAT object for plotting heatmaps as well as doing differential testing. Here we test this for DREX vs TRAX groups. Take this with a grain of salt as we have only 2 replicates, most PNAs would be classified as false-negatives !
+
+```{r Testing}
+
+### Here, groups define 2 groups for t.test. In original exmaple, multiple replicates of acf were tested against WT
+### We can try testing 2 replicates of TRAX against 2 of DREX 
+mat_sub <- mat[,grep("DREX|TRAX200",colnames(mat))]
+
+## define groups for testing
+groups <- factor(as.integer(grepl("TRAX",colnames(mat_sub))))
+
+mat_sub <- log2(mat_sub+0.01)
+p.val <- apply(mat_sub, 1, function(x){t.test(x~groups)$p.value})
+logFC <- apply(mat_sub, 1, function(x){t.test(x~groups) -> tt; tt$estimate[2]-tt$estimate[1]})
+mt <- mt.rawp2adjp(p.val, "BH")
+adj.p.val <- mt$adjp[order(mt$index),2]
+
+df <- data.frame(mat_sub, p.val, adj.p.val, logFC)
+
+head(df,n=10)
+
+#### Nothing is significant ! -- too much variability or actually no diff? 
+
+#flt <- df$adj.p.val<0.20 & df$logFC<0
+#olPNA[flt]
+# downPNA <- olPNA[flt]
+```
+## Visualization
+
+Plot SDE scores as heatmap; plot locations as Venn Diagrams and see overlap with known Chromatin States (from Kharchenko et al 2012).
+
+```{r Plotting, fig.height=10,fig.width=5}
+
+col_fun_unscaled <- colorRamp2(seq(0,5,length=11),rev(brewer.pal(n = 11, name ="RdYlBu")))
+
+hm_pna <- Heatmap(mat[,c(3,1,2,4,5,6)],cluster_columns=F,row_labels = rep(NA,nrow(mat)),col = col_fun_unscaled)
+
+# pdf("Heatmap_PNA.pdf",height=15,width=7)
+# hm_pna
+# dev.off()
+hm_pna
+
+roworder_HM <- row_order(hm_pna)
+## reorder mat
+mat_reordered<- mat[roworder_HM,c(3,1,2,4,5,6)]
+
+```
+
+We can observe that Phased Nucleosome arrays in vivo are quite different from phased nucleosomes in vitro. There is quite some overlap between DREX +/- TRAX samples but also quite some variability can be observed between replicates.
+
+```{r Venn}
+
+#pdf("Venn_allPNAs.pdf")
+
+ol <-  ChIPpeakAnno::findOverlapsOfPeaks(wtPNA_high,DREXPNA_high,TRAXPNA_high,minoverlap = 150)
+ChIPpeakAnno::makeVennDiagram(ol,NameOfPeaks = c("Fly","DREX","TRAX"))
+#dev.off()
+
+
+```
+
+We can observe variable overlaps between the number of PNAs across conditions.
+
+Now look at chromatin state distribution of shared and distinct PNAs.
+
+```{r ChromState_plot, fig.height=5, fig.width=7}
+
+uniquePeaks <- ol$uniquePeaks
+
+my_conds <- c("wt","DREX","TRAX")
+
+chrom_state <- read.delim("9STATE_S2_NArepl_dm6.bed",header=F,col.names = c("seqnames","start","end","strand","state")) %>%  makeGRangesFromDataFrame( keep.extra.columns = T)
+
+# Note: This takes a while to run, so load the table directly
+# ### initialize dataframe for barplots
+# 
+# counts_table <- as.data.frame(chrom_state) %>% group_by(state) %>% summarize(Genome.counts=sum(width))
+# 
+# ### first common peaks in all 3 datasets 
+# 
+# common_peaks <- findOverlaps(ol$peaklist$`wtPNA_high///DREXPNA_high///TRAXPNA_high`,chrom_state,ignore.strand=T)
+# 
+# counts_table[,"CommonAll"] <- table(chrom_state[as.data.frame(common_peaks)$subjectHits]$state) %>% data.frame() %>% select("Freq")
+# 
+# i <-3
+# 
+# for (i in my_conds){
+#   my_cond <- my_conds[i]
+#   my_cond_unique <- uniquePeaks[grepl(my_cond,names(uniquePeaks))]
+#   my_cond_all <- ol$all.peaks[grep(my_cond,names(ol$all.peaks))][[1]]
+#   
+#   int_unique <- findOverlaps(my_cond_unique,chrom_state,ignore.strand=T)
+#   int_all <- findOverlaps(my_cond_all,chrom_state,ignore.strand=T)
+#   
+#   counts_table[,paste0(my_cond,".unique")] <- table(chrom_state[as.data.frame(int_unique)$subjectHits]$state) %>% data.frame() %>% select("Freq")
+#   counts_table[,paste0(my_cond,".all")] <- table(chrom_state[as.data.frame(int_all)$subjectHits]$state) %>% data.frame() %>% select("Freq")
+# }
+#
+#
+#rownames(counts_table) <- counts_table$state
+#
+#counts_pct <- apply(counts_table[,c(-1)], 2, function(x){x*100/sum(x,na.rm=T)})
+#
+#saveRDS(object = counts_pct, file="counts_pct.rds")
+
+
+counts_pct <- readRDS(file="counts_pct.rds")
+
+#pdf("PNAs_ChromState.pdf",width=10,height=5)
+barplot(counts_pct,border="white",xlab="Condition",col=c("#FF0000","#CC00CC","#994C00","#FFE5CC","#006600","#636363","#3333FF","#00FFFF","#E0E0E0"),cex.names=0.8,legend.text = c("1","2","3","4","5","6","7","8","9"))
+#dev.off()
+
+```
+We can see WT unqiue (.ie. fly embryo) PNA are located majorly within chromatin states 1,2 -> which is on active promoters and gene bodies. In contrast, in vitro PNAs are not on promoters, but rather on chromatin states 9 (silent chromatin with no modifications) and 8-6 (facultative and constitutive heterochromatin).   
+
+Also possible generate heatmaps of MNase-seq signal around TSS - pick top 10% responsive -> TO DO FOR LATER!
+
+```{r Heatmaps, eval=FALSE}
+
+my_TSS <- data.frame(chr = seqnames(my_allgenes),
+                     center = ifelse(strand(my_allgenes) == "+", start(my_allgenes), end(my_allgenes)),
+                     strand = strand(my_allgenes))
+rownames(my_TSS) <- my_allgenes$gene_id
+
+### load resized fragSelected coverages
+
+my_coverage_file_names <- list.files(pattern = ".*dyadCov.rds")
+
+my_covs<-lapply(my_coverage_file_names,function(x){
+          readRDS(x)
+        })
+names(my_covs) <- gsub("_dyadCov.rds","",my_coverage_file_names)
+
+### Generate windows
+
+my_window_size <- 2000
+my_binning <- 2
+
+
+mat_path <- file.path("./matrices_site_centered")
+
+if(!dir.exists(mat_path))
+  dir.create(mat_path)
+
+i=1
+
+
+parallel::mclapply(seq_along(my_covs), mc.cores = 4, FUN = function(i){
+  
+    my_name <-  paste("mat.TSS", gsub("_ranges","", names(my_covs[i])), sep=".")
+    
+    my_cov <- my_covs[[i]]
+    
+    my_mat <- coverageWindowsCenteredStranded(centers = my_TSS,
+                                              window.size = my_window_size,
+                                              coverage = my_cov)
+    
+    my_mat <- binMeansMatrix(my_mat, my_binning)
+    
+    assign(my_name, my_mat)
+    fname <- file.path(mat_path,my_name)
+    save(list = my_name, file = paste0(fname, ".rda", sep=""))
+  
+})
+
+
+my_mat_file_names <- list.files(path = "matrices_site_centered/",pattern = "^mat\\..*rda$")
+
+for(i in seq_along(my_mat_file_names)){
+  
+  load(file.path("matrices_site_centered//", my_mat_file_names[i]))
+  
+}
+
+my_mats <- ls(pattern = "^mat.TSS")
+
+
+####################### Differential heatmaps -> Generate heatmaps with log2(CombKD) - log2(GFP) matrices -- 
+##### alternatively do K means on them and use that order on GFP + Comb KD plot 
+##### do this only for Msl2 -->  msl3 is secondary anywayy. We can later compare this to genebody plots 
+
+
+
+my_mats_sub <- my_mats[c(3,2,5)]
+  
+  # diff_mat_1 <- get(my_mats_site_chip[1])
+  # diff_mat_1[diff_mat_1 < 1] <- 1 
+  # 
+  # diff_mat_2 <- get(my_mats_site_chip[2])
+  # diff_mat_2[diff_mat_2 < 1] <- 1 
+  # 
+  diff_mat <- log2(get(my_mats_sub[2])+0.1)-log2(get(my_mats_sub[1])+0.1)    #### difference matrix 
+  
+  
+  ##ordering by difference
+  ##my_order_diff <- order(rowMeans(diff_mat[,180:220]), decreasing = T)     
+  #orderMats(my_mats = c("diff_mat"),
+  #          my_order = my_order_diff)
+  
+  # #ordering bz k-means
+  # k <- 3
+  # km <- kmeans(diff_mat, centers = k)
+  # my_order_km <- unlist(sapply(1:k, function(i){which(names(km$cluster) %in% names(km$cluster)[km$cluster == i])}))
+  # 
+  # orderMats(my_mats = c("diff_mat"),
+  #           my_order = my_order_km)
+   
+  
+  
+    
+  #   
+  # my_order <- order(rowMeans(get(my_mats_site_chip[grep("GFP",my_mats_site_chip)])), decreasing = T)
+   
+  # orderMats(my_mats = my_mats_site_chip,
+  #           my_order = my_order_diff)
+  
+  orderMats(my_mats = my_mats_site_chip,
+            my_order = my_order_km)
+  
+  my_order <- order(rowMeans(get(my_mats_sub[1])), decreasing = T)
+  
+  orderMats(my_mats = my_mats_sub,my_order=my_order) 
+    
+  all(sapply(seq_along(my_mats_sub), function(i){(identical(rownames(get(my_mats_sub[length(my_mats_sub)])), rownames(get(my_mats_sub[i]))))}))
+  #   
+  
+  png(paste("heatmaps",".png",sep=""), height = 7, width = 7, units = "in", res = 200)
+
+
+  HelpersforChIPSeq::plotHeatmap(my_sample_mats = my_mats_sub,
+                                    my_sample_names = my_mats_sub,
+                                    my_site_name = "my_TSS",
+                                    my_binning = my_binning,
+                                    my_colors = colorRampPalette((brewer.pal(n = 9, name ="OrRd")))(100),
+                                    min_value = 21,
+                                    max_value = 24
+   )
+
+  dev.off()
+  
+  
+  png(paste("heatmaps.Km.",my_site,"_",gsub("\\$","",my_chip),".png",sep=""), height = 7, width = 3.5, units = "in", res = 200)
+  
+  HelpersforChIPSeq::plotHeatmap(my_sample_mats = c("diff_mat"), 
+                                 my_sample_names = paste(c("log2(CombKD)-log2(Control)"),my_site,sep="   "),
+                                 my_site_name = my_site,
+                                 my_binning = my_binning,
+                                 my_colors = colorRampPalette(rev(brewer.pal(n = 9, name ="RdBu")))(100),
+                                 min_value = -3,
+                                 max_value = 3
+  )
+  
+    
+  dev.off()
+
+```
